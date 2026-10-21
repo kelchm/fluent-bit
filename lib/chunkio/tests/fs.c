@@ -174,8 +174,148 @@ static void test_fs_write()
     cio_destroy(ctx);
 }
 
+/* Open a second mapping without syncing or closing the writer first. */
+static void check_unsynced_chunk(struct cio_chunk *writer,
+                                const char *expected_content, const char *expected_meta)
+{
+    int err;
+    int ret;
+    void *content;
+    size_t content_size;
+    struct cio_chunk *reader;
+
+    reader = cio_chunk_open(writer->ctx, writer->st, writer->name, CIO_OPEN_RD, 0, &err);
+    TEST_CHECK(reader != NULL);
+    TEST_MSG("read-only open returned %d", err);
+    if (reader == NULL) {
+        return;
+    }
+
+    ret = cio_chunk_get_content_copy(reader, &content, &content_size);
+    TEST_CHECK(ret == CIO_OK);
+    if (ret == CIO_OK) {
+        TEST_CHECK(content_size == strlen(expected_content));
+        TEST_CHECK(content_size == strlen(expected_content) &&
+                   memcmp(content, expected_content, content_size) == 0);
+        free(content);
+    }
+
+    ret = cio_meta_cmp(reader, (char *) expected_meta, strlen(expected_meta));
+    TEST_CHECK(ret == CIO_OK);
+
+    cio_chunk_close(reader, CIO_FALSE);
+}
+
+static void test_fs_checksum_without_sync()
+{
+    int err;
+    int ret;
+    crc_t running_crc;
+    char stored_crc[sizeof(crc_t)];
+    struct cio_ctx *ctx;
+    struct cio_stream *stream;
+    struct cio_chunk *chunk;
+    struct cio_file *cf;
+    struct cio_options opts;
+
+    cio_utils_recursive_delete(CIO_ENV);
+    cio_options_init(&opts);
+    opts.root_path = CIO_ENV;
+    opts.flags = CIO_CHECKSUM;
+    ctx = cio_create(&opts);
+    TEST_CHECK(ctx != NULL);
+    if (ctx == NULL) {
+        return;
+    }
+    stream = cio_stream_create(ctx, "checksum-without-sync", CIO_STORE_FS);
+    TEST_CHECK(stream != NULL);
+    if (stream == NULL) {
+        cio_destroy(ctx);
+        return;
+    }
+    chunk = cio_chunk_open(ctx, stream, "test", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (chunk == NULL) {
+        cio_destroy(ctx);
+        return;
+    }
+    cf = chunk->backend;
+
+    ret = cio_chunk_write(chunk, "one", 3);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "one", "");
+    ret = cio_chunk_write(chunk, "two", 3);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "onetwo", "");
+
+    /* Sync must preserve both the stored CRC and the running context. */
+    running_crc = cf->crc_cur;
+    memcpy(stored_crc, cio_chunk_hash(chunk), sizeof(stored_crc));
+    ret = cio_chunk_sync(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    ret = cio_chunk_sync(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(cf->crc_cur == running_crc);
+    TEST_CHECK(memcmp(stored_crc, cio_chunk_hash(chunk), sizeof(stored_crc)) == 0);
+    check_unsynced_chunk(chunk, "onetwo", "");
+
+    ret = cio_chunk_write(chunk, "three", 5);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "onetwothree", "");
+
+    /* Recalculate after write_at truncates the existing content. */
+    ret = cio_chunk_write_at(chunk, 3, "!", 1);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "one!", "");
+    ret = cio_chunk_write_at(chunk, 0, "new", 3);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new", "");
+    ret = cio_chunk_write(chunk, "!", 1);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!", "");
+
+    /* Metadata changes must publish their checksum without a later append. */
+    ret = cio_meta_write(chunk, "metadata", 8);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!", "metadata");
+    ret = cio_meta_write(chunk, "tag", 3);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!", "tag");
+    ret = cio_meta_write(chunk, "TAG", 3);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!", "TAG");
+    ret = cio_meta_write(chunk, "", 0);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!", "");
+    ret = cio_chunk_write(chunk, "?", 1);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!?", "");
+
+    running_crc = cf->crc_cur;
+    memcpy(stored_crc, cio_chunk_hash(chunk), sizeof(stored_crc));
+    ret = cio_chunk_sync(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    ret = cio_chunk_sync(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(cf->crc_cur == running_crc);
+    TEST_CHECK(memcmp(stored_crc, cio_chunk_hash(chunk), sizeof(stored_crc)) == 0);
+    check_unsynced_chunk(chunk, "new!?", "");
+
+    /* Reopening must restore the running context for subsequent appends. */
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+    ret = cio_chunk_write(chunk, "again", 5);
+    TEST_CHECK(ret == CIO_OK);
+    check_unsynced_chunk(chunk, "new!?again", "");
+
+    cio_destroy(ctx);
+    cio_utils_recursive_delete(CIO_ENV);
+}
+
 /*
- * Create one file chunk and check it updated sha1 after a couple of writes
+ * Create one file chunk and check its checksum after a couple of writes
  * and sync.
  */
 static void test_fs_checksum()
@@ -1104,6 +1244,7 @@ static void test_metadata_unsigned_underflow()
 TEST_LIST = {
     {"fs_write",   test_fs_write},
     {"fs_checksum",  test_fs_checksum},
+    {"fs_checksum_without_sync", test_fs_checksum_without_sync},
     {"fs_up_down", test_fs_up_down},
     {"fs_size_chunks_up", test_fs_size_chunks_up},
     {"issue_51",   test_issue_51},

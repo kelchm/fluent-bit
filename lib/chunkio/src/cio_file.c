@@ -93,25 +93,6 @@ void cio_file_calculate_checksum(struct cio_file *cf, crc_t *out)
     *out = val;
 }
 
-/* Update crc32 checksum into the memory map */
-static void update_checksum(struct cio_file *cf,
-                            unsigned char *data, size_t len)
-{
-    crc_t crc;
-    crc_t tmp;
-
-    if (cf->crc_reset) {
-        cf->crc_cur = cio_crc32_init();
-        cio_file_calculate_checksum(cf, &tmp);
-        cf->crc_cur = tmp;
-        cf->crc_reset = CIO_FALSE;
-    }
-
-    crc = cio_crc32_update(cf->crc_cur, data, len);
-    memcpy(cf->map + 2, &crc, sizeof(crc));
-    cf->crc_cur = crc;
-}
-
 /* Finalize CRC32 context and update the memory map */
 static void finalize_checksum(struct cio_file *cf)
 {
@@ -121,6 +102,16 @@ static void finalize_checksum(struct cio_file *cf)
     crc = htonl(crc);
 
     memcpy(cf->map + 2, &crc, sizeof(crc));
+}
+
+/* Update the stored checksum after the content and its length are written. */
+static void update_checksum(struct cio_file *cf,
+                            crc_t crc)
+{
+    /* Keep the running context unfinalized for subsequent appends. */
+    cf->crc_cur = crc;
+    cf->crc_reset = CIO_FALSE;
+    finalize_checksum(cf);
 }
 
 /*
@@ -137,6 +128,7 @@ static int adjust_layout(struct cio_chunk *ch,
         /* reset current crc since we are calculating from zero */
         cf->crc_cur = cio_crc32_init();
         cio_file_calculate_checksum(cf, &cf->crc_cur);
+        finalize_checksum(cf);
     }
 
     /* Sync changes to disk */
@@ -999,6 +991,7 @@ int cio_file_write(struct cio_chunk *ch, const void *buf, size_t count)
     size_t av_size;
     size_t old_size;
     size_t new_size;
+    crc_t crc = 0;
     struct cio_file *cf;
 
     if (count == 0) {
@@ -1047,16 +1040,18 @@ int cio_file_write(struct cio_chunk *ch, const void *buf, size_t count)
                       old_size, new_size);
     }
 
-    /* If crc_reset was toggled we know that data_size was
-     * modified by cio_chunk_write_at which means we need
-     * to update the header before we recalculate the checksum
-     */
-    if (cf->crc_reset) {
-        cio_file_st_set_content_len(cf->map, cf->data_size);
-    }
-
+    /* Calculate before changing the map to minimize the inconsistent window. */
     if (ch->ctx->options.flags & CIO_CHECKSUM) {
-        update_checksum(cf, (unsigned char *) buf, count);
+        if (cf->crc_reset) {
+            /* write_at retains only the content preceding the write offset. */
+            crc = cio_crc32_init();
+            crc = cio_crc32_update(crc, cf->map + CIO_FILE_CONTENT_OFFSET,
+                                   2 + meta_len + cf->data_size);
+        }
+        else {
+            crc = cf->crc_cur;
+        }
+        crc = cio_crc32_update(crc, buf, count);
     }
 
     cf->st_content = cio_file_st_get_content(cf->map);
@@ -1066,6 +1061,10 @@ int cio_file_write(struct cio_chunk *ch, const void *buf, size_t count)
     cf->synced = CIO_FALSE;
 
     cio_file_st_set_content_len(cf->map, cf->data_size);
+
+    if (ch->ctx->options.flags & CIO_CHECKSUM) {
+        update_checksum(cf, crc);
+    }
 
     cf->taint_flag = CIO_TRUE;
 
